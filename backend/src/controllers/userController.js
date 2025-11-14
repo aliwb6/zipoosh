@@ -1,4 +1,4 @@
-const User = require('../models/User ');
+const User = require('../models/User');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { ErrorResponse } = require('../middleware/errorHandler');
 const { paginate, getPaginationInfo } = require('../utils/helpers');

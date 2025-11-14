@@ -1,428 +1,529 @@
-const User = require('../models/User ');
-const { generateToken } = require('../utils/generateToken');
-const { sendWelcomeEmail, sendPasswordResetEmail } = require('../utils/sendEmail');
-const { sendWelcomeSMS, sendOTP } = require('../utils/sendSMS');
+const Product = require('../models/Product');
+const Category = require('../models/Category');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { ErrorResponse } = require('../middleware/errorHandler');
-const crypto = require('crypto');
+const { uploadMultipleImages, deleteImage } = require('../utils/cloudinary');
+const { paginate, getPaginationInfo } = require('../utils/helpers');
 
 /**
- * @desc    ثبت نام کاربر جدید
- * @route   POST /api/auth/register
+ * @desc    دریافت تمام محصولات با فیلتر و جستجو
+ * @route   GET /api/products
  * @access  Public
  */
-const register = asyncHandler(async (req, res, next) => {
-  const { name, email, phone, password } = req.body;
+const getProducts = asyncHandler(async (req, res) => {
+  const {
+    page = 1,
+    limit = 12,
+    sort = '-createdAt',
+    category,
+    minPrice,
+    maxPrice,
+    gender,
+    size,
+    color,
+    brand,
+    search,
+    isFeatured,
+    isNewArrival,
+    status = 'active'
+  } = req.query;
 
-  // بررسی وجود کاربر با این ایمیل یا شماره تلفن
-  const existingUser = await User.findOne({
-    $or: [{ email }, { phone }]
-  });
+  // ساخت query
+  const query = { status };
 
-  if (existingUser) {
-    if (existingUser.email === email) {
-      return next(new ErrorResponse('این ایمیل قبلا ثبت شده است', 400));
-    }
-    if (existingUser.phone === phone) {
-      return next(new ErrorResponse('این شماره تلفن قبلا ثبت شده است', 400));
-    }
+  // فیلتر دسته‌بندی
+  if (category) {
+    query.category = category;
   }
 
-  // ایجاد کاربر جدید
-  const user = await User.create({
+  // فیلتر قیمت
+  if (minPrice || maxPrice) {
+    query.price = {};
+    if (minPrice) query.price.$gte = Number(minPrice);
+    if (maxPrice) query.price.$lte = Number(maxPrice);
+  }
+
+  // فیلتر جنسیت
+  if (gender) {
+    query.gender = gender;
+  }
+
+  // فیلتر سایز
+  if (size) {
+    query['sizes.name'] = size;
+  }
+
+  // فیلتر رنگ
+  if (color) {
+    query['colors.name'] = color;
+  }
+
+  // فیلتر برند
+  if (brand) {
+    query.brand = new RegExp(brand, 'i');
+  }
+
+  // جستجو
+  if (search) {
+    query.$text = { $search: search };
+  }
+
+  // فیلتر ویژه
+  if (isFeatured) {
+    query.isFeatured = isFeatured === 'true';
+  }
+
+  // فیلتر تازه‌ها
+  if (isNewArrival) {
+    query.isNewArrival = isNewArrival === 'true';
+  }
+
+  // اجرای query با pagination
+  const result = await paginate(Product, query, {
+    page: Number(page),
+    limit: Number(limit),
+    sort,
+    populate: 'category'
+  });
+
+  res.json({
+    success: true,
+    count: result.data.length,
+    pagination: result.pagination,
+    data: {
+      products: result.data
+    }
+  });
+});
+
+/**
+ * @desc    دریافت یک محصول با ID یا slug
+ * @route   GET /api/products/:id
+ * @access  Public
+ */
+const getProduct = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  // جستجو با ID یا slug
+  const product = await Product.findOne({
+    $or: [{ _id: id }, { slug: id }]
+  })
+    .populate('category')
+    .populate({
+      path: 'reviews',
+      populate: { path: 'user', select: 'name avatar' }
+    });
+
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
+  }
+
+  // افزایش تعداد بازدید
+  product.viewCount += 1;
+  await product.save();
+
+  res.json({
+    success: true,
+    data: {
+      product
+    }
+  });
+});
+
+/**
+ * @desc    ایجاد محصول جدید
+ * @route   POST /api/products
+ * @access  Private/Admin
+ */
+const createProduct = asyncHandler(async (req, res, next) => {
+  const {
     name,
-    email,
-    phone,
-    password
-  });
+    description,
+    category,
+    subCategory,
+    price,
+    discountPrice,
+    colors,
+    sizes,
+    brand,
+    material,
+    weight,
+    gender,
+    features,
+    sizeGuide,
+    tags,
+    isFeatured,
+    isNewArrival,
+    metaTitle,
+    metaDescription,
+    metaKeywords
+  } = req.body;
 
-  // ارسال ایمیل و پیامک خوش‌آمدگویی (غیر مسدودکننده)
-  try {
-    await Promise.all([
-      sendWelcomeEmail(email, name),
-      sendWelcomeSMS(phone, name)
-    ]);
-  } catch (error) {
-    console.error('خطا در ارسال پیام خوش‌آمدگویی:', error);
-    // ادامه می‌دهیم حتی اگر ارسال پیام با خطا مواجه شد
+  // بررسی وجود دسته‌بندی
+  const categoryExists = await Category.findById(category);
+  if (!categoryExists) {
+    return next(new ErrorResponse('دسته‌بندی یافت نشد', 404));
   }
 
-  // تولید توکن
-  const token = generateToken(user._id);
+  // محاسبه موجودی کل
+  let totalStock = 0;
+  if (sizes && Array.isArray(sizes)) {
+    totalStock = sizes.reduce((sum, size) => sum + (size.stock || 0), 0);
+  }
+
+  // ایجاد محصول
+  const product = await Product.create({
+    name,
+    description,
+    category,
+    subCategory,
+    price,
+    discountPrice,
+    colors: colors || [],
+    sizes: sizes || [],
+    totalStock,
+    brand,
+    material,
+    weight,
+    gender,
+    features: features || [],
+    sizeGuide,
+    tags: tags || [],
+    isFeatured: isFeatured || false,
+    isNewArrival: isNewArrival !== false,
+    metaTitle,
+    metaDescription,
+    metaKeywords,
+    images: [],
+    thumbnail: 'https://via.placeholder.com/400x500'
+  });
 
   res.status(201).json({
     success: true,
-    message: 'ثبت نام با موفقیت انجام شد',
+    message: 'محصول با موفقیت ایجاد شد',
     data: {
-      user: user.getPublicProfile(),
-      token
+      product
     }
   });
 });
 
 /**
- * @desc    ورود کاربر
- * @route   POST /api/auth/login
- * @access  Public
+ * @desc    بروزرسانی محصول
+ * @route   PUT /api/products/:id
+ * @access  Private/Admin
  */
-const login = asyncHandler(async (req, res, next) => {
-  const { email, password } = req.body;
+const updateProduct = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
 
-  // بررسی وجود کاربر
-  const user = await User.findOne({ email }).select('+password');
+  let product = await Product.findById(id);
 
-  if (!user) {
-    return next(new ErrorResponse('ایمیل یا رمز عبور اشتباه است', 401));
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
   }
 
-  // بررسی رمز عبور
-  const isPasswordMatch = await user.matchPassword(password);
-
-  if (!isPasswordMatch) {
-    return next(new ErrorResponse('ایمیل یا رمز عبور اشتباه است', 401));
+  // اگر دسته‌بندی تغییر کرد، بررسی وجود آن
+  if (req.body.category && req.body.category !== product.category.toString()) {
+    const categoryExists = await Category.findById(req.body.category);
+    if (!categoryExists) {
+      return next(new ErrorResponse('دسته‌بندی یافت نشد', 404));
+    }
   }
 
-  // بررسی فعال بودن حساب
-  if (!user.isActive) {
-    return next(new ErrorResponse('حساب کاربری شما غیرفعال شده است', 403));
-  }
-
-  // تولید توکن
-  const token = generateToken(user._id);
+  // بروزرسانی
+  product = await Product.findByIdAndUpdate(id, req.body, {
+    new: true,
+    runValidators: true
+  }).populate('category');
 
   res.json({
     success: true,
-    message: 'ورود موفقیت‌آمیز بود',
+    message: 'محصول با موفقیت بروزرسانی شد',
     data: {
-      user: user.getPublicProfile(),
-      token
+      product
     }
   });
 });
 
 /**
- * @desc    دریافت اطلاعات کاربر جاری
- * @route   GET /api/auth/me
- * @access  Private
+ * @desc    حذف محصول
+ * @route   DELETE /api/products/:id
+ * @access  Private/Admin
  */
-const getMe = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id)
-    .populate('wishlist', 'name slug thumbnail price discountPrice');
+const deleteProduct = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  const product = await Product.findById(id);
+
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
+  }
+
+  // حذف تصاویر از Cloudinary (اگر وجود داشته باشد)
+  if (product.images && product.images.length > 0) {
+    for (const image of product.images) {
+      if (image.publicId) {
+        try {
+          await deleteImage(image.publicId);
+        } catch (error) {
+          console.error('خطا در حذف تصویر:', error);
+        }
+      }
+    }
+  }
+
+  await product.deleteOne();
 
   res.json({
     success: true,
+    message: 'محصول با موفقیت حذف شد',
+    data: {}
+  });
+});
+
+/**
+ * @desc    آپلود تصاویر محصول
+ * @route   POST /api/products/:id/images
+ * @access  Private/Admin
+ */
+const uploadProductImages = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  const product = await Product.findById(id);
+
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
+  }
+
+  if (!req.files || req.files.length === 0) {
+    return next(new ErrorResponse('لطفا حداقل یک تصویر انتخاب کنید', 400));
+  }
+
+  console.log(`📷 در حال آپلود ${req.files.length} تصویر برای محصول ${product.name}`);
+
+  // فعلاً URLs موقت استفاده میکنیم (بعداً با Cloudinary جایگزین میشه)
+  const images = req.files.map((file, index) => ({
+    url: `https://via.placeholder.com/400x500?text=Product+Image+${index + 1}`,
+    publicId: `temp_${Date.now()}_${index}`,
+    alt: product.name
+  }));
+
+  product.images.push(...images);
+
+  // اگر thumbnail نداره، اولین تصویر رو به عنوان thumbnail تنظیم کن
+  if (!product.thumbnail || product.thumbnail.includes('placeholder')) {
+    product.thumbnail = images[0].url;
+  }
+
+  await product.save();
+
+  res.json({
+    success: true,
+    message: 'تصاویر با موفقیت آپلود شدند',
     data: {
-      user: user.getPublicProfile()
+      product
     }
   });
 });
 
 /**
- * @desc    بروزرسانی پروفایل کاربر
- * @route   PUT /api/auth/profile
- * @access  Private
+ * @desc    حذف تصویر محصول
+ * @route   DELETE /api/products/:id/images/:imageId
+ * @access  Private/Admin
  */
-const updateProfile = asyncHandler(async (req, res, next) => {
-  const { name, email, phone } = req.body;
+const deleteProductImage = asyncHandler(async (req, res, next) => {
+  const { id, imageId } = req.params;
 
-  // اگر ایمیل یا شماره تلفن تغییر کرده، بررسی تکراری نبودن
-  if (email && email !== req.user.email) {
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return next(new ErrorResponse('این ایمیل قبلا ثبت شده است', 400));
-    }
+  const product = await Product.findById(id);
+
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
   }
 
-  if (phone && phone !== req.user.phone) {
-    const existingUser = await User.findOne({ phone });
-    if (existingUser) {
-      return next(new ErrorResponse('این شماره تلفن قبلا ثبت شده است', 400));
-    }
-  }
-
-  // بروزرسانی اطلاعات
-  const user = await User.findByIdAndUpdate(
-    req.user._id,
-    {
-      name: name || req.user.name,
-      email: email || req.user.email,
-      phone: phone || req.user.phone,
-      // اگر ایمیل یا شماره تغییر کرد، تایید را false کن
-      ...(email && email !== req.user.email && { isEmailVerified: false }),
-      ...(phone && phone !== req.user.phone && { isPhoneVerified: false })
-    },
-    { new: true, runValidators: true }
+  // پیدا کردن تصویر
+  const imageIndex = product.images.findIndex(
+    img => img._id.toString() === imageId
   );
 
-  res.json({
-    success: true,
-    message: 'پروفایل با موفقیت بروزرسانی شد',
-    data: {
-      user: user.getPublicProfile()
-    }
-  });
-});
-
-/**
- * @desc    تغییر رمز عبور
- * @route   PUT /api/auth/change-password
- * @access  Private
- */
-const changePassword = asyncHandler(async (req, res, next) => {
-  const { currentPassword, newPassword } = req.body;
-
-  // دریافت کاربر با رمز عبور
-  const user = await User.findById(req.user._id).select('+password');
-
-  // بررسی رمز عبور فعلی
-  const isPasswordMatch = await user.matchPassword(currentPassword);
-
-  if (!isPasswordMatch) {
-    return next(new ErrorResponse('رمز عبور فعلی اشتباه است', 401));
+  if (imageIndex === -1) {
+    return next(new ErrorResponse('تصویر یافت نشد', 404));
   }
 
-  // تنظیم رمز عبور جدید
-  user.password = newPassword;
-  await user.save();
+  const image = product.images[imageIndex];
 
-  res.json({
-    success: true,
-    message: 'رمز عبور با موفقیت تغییر یافت'
-  });
-});
-
-/**
- * @desc    درخواست بازیابی رمز عبور
- * @route   POST /api/auth/forgot-password
- * @access  Public
- */
-const forgotPassword = asyncHandler(async (req, res, next) => {
-  const { email } = req.body;
-
-  const user = await User.findOne({ email });
-
-  if (!user) {
-    return next(new ErrorResponse('کاربری با این ایمیل یافت نشد', 404));
-  }
-
-  // تولید توکن بازیابی
-  const resetToken = crypto.randomBytes(32).toString('hex');
-
-  // هش کردن و ذخیره توکن
-  user.resetPasswordToken = crypto
-    .createHash('sha256')
-    .update(resetToken)
-    .digest('hex');
-
-  // تنظیم زمان انقضا (10 دقیقه)
-  user.resetPasswordExpire = Date.now() + 10 * 60 * 1000;
-
-  await user.save({ validateBeforeSave: false });
-
-  // ارسال ایمیل
-  try {
-    await sendPasswordResetEmail(user.email, resetToken);
-
-    res.json({
-      success: true,
-      message: 'لینک بازیابی رمز عبور به ایمیل شما ارسال شد'
-    });
-  } catch (error) {
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-    await user.save({ validateBeforeSave: false });
-
-    return next(new ErrorResponse('خطا در ارسال ایمیل', 500));
-  }
-});
-
-/**
- * @desc    بازیابی رمز عبور
- * @route   PUT /api/auth/reset-password/:token
- * @access  Public
- */
-const resetPassword = asyncHandler(async (req, res, next) => {
-  const { token } = req.params;
-  const { password } = req.body;
-
-  // هش کردن توکن برای مقایسه
-  const resetPasswordToken = crypto
-    .createHash('sha256')
-    .update(token)
-    .digest('hex');
-
-  // پیدا کردن کاربر با توکن معتبر
-  const user = await User.findOne({
-    resetPasswordToken,
-    resetPasswordExpire: { $gt: Date.now() }
-  });
-
-  if (!user) {
-    return next(new ErrorResponse('توکن نامعتبر یا منقضی شده است', 400));
-  }
-
-  // تنظیم رمز عبور جدید
-  user.password = password;
-  user.resetPasswordToken = undefined;
-  user.resetPasswordExpire = undefined;
-  await user.save();
-
-  // تولید توکن جدید برای ورود خودکار
-  const authToken = generateToken(user._id);
-
-  res.json({
-    success: true,
-    message: 'رمز عبور با موفقیت تغییر یافت',
-    data: {
-      user: user.getPublicProfile(),
-      token: authToken
-    }
-  });
-});
-
-/**
- * @desc    ارسال کد تایید شماره تلفن
- * @route   POST /api/auth/send-otp
- * @access  Private
- */
-const sendPhoneOTP = asyncHandler(async (req, res, next) => {
-  const user = req.user;
-
-  // تولید و ارسال کد OTP
-  const otp = await sendOTP(user.phone);
-
-  // ذخیره کد در session یا cache (فعلا در متغیر موقت)
-  // TODO: استفاده از Redis برای ذخیره OTP
-  // await redis.set(`otp:${user._id}`, otp, 'EX', 300); // 5 دقیقه
-
-  res.json({
-    success: true,
-    message: 'کد تایید به شماره شما ارسال شد',
-    // در production این رو نباید برگردونیم
-    ...(process.env.NODE_ENV === 'development' && { otp })
-  });
-});
-
-/**
- * @desc    تایید شماره تلفن با کد OTP
- * @route   POST /api/auth/verify-phone
- * @access  Private
- */
-const verifyPhone = asyncHandler(async (req, res, next) => {
-  const { otp } = req.body;
-
-  // TODO: بررسی کد OTP از Redis
-  // const savedOtp = await redis.get(`otp:${req.user._id}`);
-  // if (!savedOtp || savedOtp !== otp) {
-  //   return next(new ErrorResponse('کد تایید نامعتبر یا منقضی شده است', 400));
-  // }
-
-  // فعلا فقط بررسی ساده
-  if (!otp) {
-    return next(new ErrorResponse('کد تایید الزامی است', 400));
-  }
-
-  // تایید شماره
-  const user = await User.findByIdAndUpdate(
-    req.user._id,
-    { isPhoneVerified: true },
-    { new: true }
-  );
-
-  // حذف کد از cache
-  // await redis.del(`otp:${req.user._id}`);
-
-  res.json({
-    success: true,
-    message: 'شماره تلفن با موفقیت تایید شد',
-    data: {
-      user: user.getPublicProfile()
-    }
-  });
-});
-
-/**
- * @desc    آپلود آواتار
- * @route   PUT /api/auth/avatar
- * @access  Private
- */
-const uploadAvatar = asyncHandler(async (req, res, next) => {
-  if (!req.file) {
-    return next(new ErrorResponse('لطفا یک تصویر انتخاب کنید', 400));
-  }
-
-  const { uploadImage, deleteImage } = require('../utils/cloudinary');
-
-  // حذف آواتار قبلی (اگر وجود داشته باشه و از Cloudinary باشه)
-  if (req.user.avatar && req.user.avatar.includes('cloudinary')) {
-    const oldPublicId = req.user.avatar.split('/').pop().split('.')[0];
+  // حذف از Cloudinary (اگر publicId داشته باشد)
+  if (image.publicId && !image.publicId.startsWith('temp_')) {
     try {
-      await deleteImage(`zipoosh/avatars/${oldPublicId}`);
+      await deleteImage(image.publicId);
     } catch (error) {
-      console.error('خطا در حذف آواتار قبلی:', error);
+      console.error('خطا در حذف تصویر از Cloudinary:', error);
     }
   }
 
-  // آپلود تصویر جدید
-  const result = await uploadImage(req.file.base64, 'zipoosh/avatars');
+  // حذف از آرایه
+  product.images.splice(imageIndex, 1);
 
-  // بروزرسانی کاربر
-  const user = await User.findByIdAndUpdate(
-    req.user._id,
-    { avatar: result.url },
-    { new: true }
-  );
+  await product.save();
 
   res.json({
     success: true,
-    message: 'آواتار با موفقیت بروزرسانی شد',
+    message: 'تصویر با موفقیت حذف شد',
     data: {
-      user: user.getPublicProfile()
+      product
     }
   });
 });
 
 /**
- * @desc    حذف حساب کاربری
- * @route   DELETE /api/auth/account
- * @access  Private
+ * @desc    دریافت محصولات مرتبط
+ * @route   GET /api/products/:id/related
+ * @access  Public
  */
-const deleteAccount = asyncHandler(async (req, res, next) => {
-  const { password } = req.body;
+const getRelatedProducts = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const limit = Number(req.query.limit) || 4;
 
-  // دریافت کاربر با رمز عبور
-  const user = await User.findById(req.user._id).select('+password');
+  const product = await Product.findById(id);
 
-  // بررسی رمز عبور
-  const isPasswordMatch = await user.matchPassword(password);
-
-  if (!isPasswordMatch) {
-    return next(new ErrorResponse('رمز عبور اشتباه است', 401));
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
   }
 
-  // به جای حذف، غیرفعال می‌کنیم
-  user.isActive = false;
-  await user.save();
-
-  // یا می‌تونیم کاملا حذف کنیم:
-  // await user.remove();
+  // پیدا کردن محصولات مرتبط (همان دسته‌بندی، به جز خود محصول)
+  const relatedProducts = await Product.find({
+    category: product.category,
+    _id: { $ne: product._id },
+    status: 'active'
+  })
+    .limit(limit)
+    .sort('-rating -soldCount')
+    .select('name slug thumbnail price discountPrice rating numReviews');
 
   res.json({
     success: true,
-    message: 'حساب کاربری با موفقیت حذف شد'
+    count: relatedProducts.length,
+    data: {
+      products: relatedProducts
+    }
+  });
+});
+
+/**
+ * @desc    بروزرسانی موجودی محصول
+ * @route   PUT /api/products/:id/stock
+ * @access  Private/Admin
+ */
+const updateStock = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { sizes } = req.body;
+
+  const product = await Product.findById(id);
+
+  if (!product) {
+    return next(new ErrorResponse('محصول یافت نشد', 404));
+  }
+
+  if (!sizes || !Array.isArray(sizes)) {
+    return next(new ErrorResponse('لطفا اطلاعات موجودی را ارسال کنید', 400));
+  }
+
+  // بروزرسانی موجودی
+  product.sizes = sizes;
+  await product.save();
+
+  res.json({
+    success: true,
+    message: 'موجودی با موفقیت بروزرسانی شد',
+    data: {
+      product
+    }
+  });
+});
+
+/**
+ * @desc    دریافت محصولات ویژه
+ * @route   GET /api/products/featured/list
+ * @access  Public
+ */
+const getFeaturedProducts = asyncHandler(async (req, res) => {
+  const limit = Number(req.query.limit) || 8;
+
+  const products = await Product.find({
+    isFeatured: true,
+    status: 'active'
+  })
+    .limit(limit)
+    .sort('-rating -soldCount')
+    .select('name slug thumbnail price discountPrice rating numReviews isFeatured');
+
+  res.json({
+    success: true,
+    count: products.length,
+    data: {
+      products
+    }
+  });
+});
+
+/**
+ * @desc    دریافت محصولات جدید
+ * @route   GET /api/products/new-arrivals/list
+ * @access  Public
+ */
+const getNewArrivals = asyncHandler(async (req, res) => {
+  const limit = Number(req.query.limit) || 8;
+
+  const products = await Product.find({
+    isNewArrival: true,
+    status: 'active'
+  })
+    .limit(limit)
+    .sort('-createdAt')
+    .select('name slug thumbnail price discountPrice rating numReviews isNewArrival');
+
+  res.json({
+    success: true,
+    count: products.length,
+    data: {
+      products
+    }
+  });
+});
+
+/**
+ * @desc    دریافت پرفروش‌ترین محصولات
+ * @route   GET /api/products/best-sellers/list
+ * @access  Public
+ */
+const getBestSellers = asyncHandler(async (req, res) => {
+  const limit = Number(req.query.limit) || 8;
+
+  const products = await Product.find({
+    status: 'active'
+  })
+    .limit(limit)
+    .sort('-soldCount -rating')
+    .select('name slug thumbnail price discountPrice rating numReviews soldCount');
+
+  res.json({
+    success: true,
+    count: products.length,
+    data: {
+      products
+    }
   });
 });
 
 module.exports = {
-  register,
-  login,
-  getMe,
-  updateProfile,
-  changePassword,
-  forgotPassword,
-  resetPassword,
-  sendPhoneOTP,
-  verifyPhone,
-  uploadAvatar,
-  deleteAccount
+  getProducts,
+  getProduct,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  uploadProductImages,
+  deleteProductImage,
+  getRelatedProducts,
+  updateStock,
+  getFeaturedProducts,
+  getNewArrivals,
+  getBestSellers
 };

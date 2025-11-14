@@ -14,8 +14,7 @@ const {
 
 const { protect } = require('../middleware/auth');
 const { admin } = require('../middleware/admin');
-const { uploadMultiple } = require('../middleware/upload');
-const { processImage } = require('../middleware/upload');
+const { uploadReviewImages } = require('../middleware/upload');
 const {
   validateCreateReview,
   validateMongoId,
@@ -30,16 +29,15 @@ router.use(protect);
 
 router.post(
   '/',
-  uploadMultiple('images', 5),
-  processImage,
+  uploadReviewImages,
   validateCreateReview,
   createReview
 );
 
 router.put(
   '/:id',
-  uploadMultiple('images', 5),
-  processImage,
+  uploadReviewImages,
+  
   validateMongoId('id'),
   updateReview
 );
