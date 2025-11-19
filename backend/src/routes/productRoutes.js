@@ -1,5 +1,49 @@
 const express = require('express');
 const router = express.Router();
+
+const {
+  getProducts,
+  getProduct,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  getRelatedProducts,
+  getFeaturedProducts,
+  getNewArrivals,
+  getBestSellers,
+  updateStock
+} = require('../controllers/productController');
+
+const { protect, authorize } = require('../middleware/auth');
+const { uploadProductImages } = require('../middleware/upload');
+const {
+  validateCreateProduct,
+  validateUpdateProduct,
+  validateMongoId,
+  validatePagination
+} = require('../middleware/validation');
+
+// 🔍 اضافه کن این خطوط برای دیباگ:
+console.log('=== Debugging Middleware ===');
+console.log('protect:', typeof protect);
+console.log('authorize:', typeof authorize);
+console.log('uploadProductImages:', typeof uploadProductImages);
+console.log('validateCreateProduct:', typeof validateCreateProduct);
+console.log('validateUpdateProduct:', typeof validateUpdateProduct);
+console.log('validateMongoId:', typeof validateMongoId);
+console.log('validatePagination:', typeof validatePagination);
+console.log('=== Controllers ===');
+console.log('createProduct:', typeof createProduct);
+console.log('updateProduct:', typeof updateProduct);
+console.log('deleteProduct:', typeof deleteProduct);
+console.log('updateStock:', typeof updateStock);
+console.log('===========================');
+
+
+
+
+const express = require('express');
+const router = express.Router();
 const {
   getProducts,
   getProduct,
