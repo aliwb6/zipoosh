@@ -36,7 +36,7 @@ router.get('/:id/related', validateMongoId('id'), getRelatedProducts);
 router.post(
   '/',
   protect,
-  admin,
+  authorize('admin'),
   uploadProductImages,
   validateCreateProduct,
   createProduct
@@ -45,7 +45,7 @@ router.post(
 router.put(
   '/:id',
   protect,
-  admin,
+  authorize('admin'),
   uploadProductImages,
   validateUpdateProduct,
   updateProduct
@@ -54,7 +54,7 @@ router.put(
 router.delete(
   '/:id',
   protect,
-  admin,
+  authorize('admin'),
   validateMongoId('id'),
   deleteProduct
 );
@@ -62,7 +62,7 @@ router.delete(
 router.put(
   '/:id/stock',
   protect,
-  admin,
+  authorize('admin'),
   validateMongoId('id'),
   updateStock
 );
