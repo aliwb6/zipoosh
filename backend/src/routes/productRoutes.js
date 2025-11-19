@@ -14,7 +14,6 @@ const {
 } = require('../controllers/productController');
 
 const { protect } = require('../middleware/auth');
-const { admin } = require('../middleware/admin');
 const { uploadProductImages } = require('../middleware/upload');
 const {
   validateCreateProduct,
